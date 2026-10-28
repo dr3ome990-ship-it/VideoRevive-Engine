@@ -1,0 +1,98 @@
+name: Build Windows Media Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag, e.g. engine-v1"
+        required: true
+        default: "engine-v1"
+
+permissions:
+  contents: write
+
+jobs:
+  cross-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64 and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake build-essential git libtool make \
+            mingw-w64 nasm yasm pkg-config file
+      - name: Cross-compile Windows x64 FFmpeg and FFprobe
+        run: bash scripts/build-engine.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: videorevive-engine-win64
+          path: |
+            dist/ffmpeg.exe
+            dist/ffprobe.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-smoke-test-and-release:
+    needs: cross-build
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: videorevive-engine-win64
+          path: dist
+      - name: Verify Windows executables, encode, probe and remux
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ff = (Resolve-Path "dist/ffmpeg.exe").Path
+          $fp = (Resolve-Path "dist/ffprobe.exe").Path
+          & $ff -hide_banner -version
+          if ($LASTEXITCODE -ne 0) { throw 'ffmpeg failed to start' }
+          & $fp -hide_banner -version
+          if ($LASTEXITCODE -ne 0) { throw 'ffprobe failed to start' }
+          $encoders = (& $ff -hide_banner -encoders 2>&1) -join "`n"
+          if ($encoders -notmatch 'libx264' -or $encoders -notmatch '\baac\b') { throw 'Missing required encoders' }
+          # Generate a tiny YUV420p frame stream using Python bundled with runner.
+          @'
+          from pathlib import Path
+          frame = bytes([100]) * (16*16) + bytes([128]) * (8*8) + bytes([128]) * (8*8)
+          Path("test.yuv").write_bytes(frame * 2)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'test sample generation failed' }
+          & $ff -hide_banner -y -v error -f rawvideo -pixel_format yuv420p -video_size 16x16 -framerate 1 -i test.yuv -c:v libx264 -pix_fmt yuv420p -frames:v 2 sample.mp4
+          if ($LASTEXITCODE -ne 0) { throw 'x264 encode failed' }
+          & $fp -v error -show_entries format=duration -of default=noprint_wrappers=1 sample.mp4
+          if ($LASTEXITCODE -ne 0) { throw 'ffprobe MP4 failed' }
+          & $ff -hide_banner -y -v error -i sample.mp4 -map 0 -c copy -movflags +faststart remux.mp4
+          if ($LASTEXITCODE -ne 0) { throw 'MP4 stream-copy remux failed' }
+          if ((Get-Item remux.mp4).Length -lt 100) { throw 'Invalid remux output' }
+          Write-Host 'Windows media engine smoke tests PASSED'
+      - name: Generate immutable-download manifest and release assets
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:TAG
+          if ($tag -notmatch '^engine-v[0-9]+(?:\.[0-9]+){0,2}$') { throw 'Invalid release tag' }
+          $components = @{}
+          foreach ($name in @('ffmpeg','ffprobe')) {
+            $path = "dist/$name.exe"
+            $components[$name] = @{
+              url = "https://github.com/$env:REPO/releases/download/$tag/$name.exe"
+              sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+              size = (Get-Item $path).Length
+            }
+          }
+          @{ version = $tag; components = $components } |
+            ConvertTo-Json -Depth 5 |
+            Set-Content -Path dist/engine-manifest.json -Encoding utf8
+          Copy-Item THIRD_PARTY_LICENSES.md dist/THIRD_PARTY_LICENSES.md
+          gh release create $tag dist/ffmpeg.exe dist/ffprobe.exe dist/engine-manifest.json dist/THIRD_PARTY_LICENSES.md --repo $env:REPO --title "VideoRevive Media Engine $tag" --notes "Windows x64 FFmpeg/FFprobe with libx264 and AAC. Smoke-tested on Windows. GPL-licensed build; see license notices and corresponding source links."
+          if ($LASTEXITCODE -ne 0) { throw 'Release publishing failed' }
